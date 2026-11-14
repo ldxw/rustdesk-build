@@ -1,0 +1,160 @@
+# 从上游 rustdesk/rustdesk 拉取指定版本的 tag，在本仓库创建同名分支存放。
+#
+# 用法：Actions 页面选择「Sync upstream tag to branch」→ Run workflow
+#   version  要同步的版本，如 1.5.3（也接受 v1.5.3）；
+#            留空或填 latest 表示取上游最新版本 tag
+#   force    默认关闭。同名分支已存在且指向不同 commit 时，
+#            关闭 = 跳过并提示，开启 = 强制更新到上游 commit
+#
+# 结果四种：新建分支 / 已存在且一致 / 已存在未更新 / 已强制更新。
+# 每次运行的明细写入该次运行的 Job Summary。
+#
+# 注意：
+#   - 仅手动触发，没有定时任务。
+#   - 只识别 x.y.z 或 x.y.z-N 形式的版本 tag，nightly / fdroid-version 会被忽略。
+#   - 本仓库即使还没有任何 commit 也能运行；首次运行后本仓库会多出对应版本分支。
+
+name: Sync upstream tag to branch
+
+on:
+  # 仅手动触发，不设定时任务
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '要拉取的版本 tag（如 1.5.3）；留空或填 latest 表示上游最新版本'
+        required: false
+        default: 'latest'
+      force:
+        description: '强制拉取：同名分支已存在且指向不同 commit 时，强制更新到上游 commit（默认关闭）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-tags
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: https://github.com/rustdesk/rustdesk.git
+      REQUESTED_VERSION: ${{ inputs.version || 'latest' }}
+      FORCE: ${{ inputs.force || 'false' }}
+      # 只认版本号形式的 tag，排除 nightly / fdroid-version
+      TAG_PATTERN: '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$'
+
+    steps:
+      # 本项目可能是空仓库（尚无 commit），因此不用 actions/checkout，
+      # 直接初始化一个只用于推送的本地仓库。
+      - name: 初始化仓库并配置凭据
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$TOKEN"
+          git init -q -b main
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          # token 只写入 local config，不出现在 URL、命令行参数和日志里
+          auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic ${auth}"
+          echo "origin: https://github.com/${GITHUB_REPOSITORY}.git"
+
+      - name: 解析目标版本
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          mapfile -t all_tags < <(
+            git ls-remote --tags --refs "$UPSTREAM_REPO" 'refs/tags/*' \
+              | awk -F'refs/tags/' '{print $2}' \
+              | grep -E "$TAG_PATTERN" \
+              | sort -V
+          )
+
+          if [ "${#all_tags[@]}" -eq 0 ]; then
+            echo "::error::上游没有匹配 $TAG_PATTERN 的版本 tag"
+            exit 1
+          fi
+
+          latest="${all_tags[-1]}"
+          requested="$REQUESTED_VERSION"
+
+          if [ -z "$requested" ] || [ "$requested" = "latest" ]; then
+            version="$latest"
+          else
+            # 容忍手填的 v 前缀
+            requested="${requested#v}"
+            if ! printf '%s\n' "${all_tags[@]}" | grep -Fxq "$requested"; then
+              echo "::error::上游不存在版本 tag: $requested"
+              {
+                echo "## 未找到版本 \`$requested\`"
+                echo ''
+                echo '可用版本（最近 20 个，新的在前）：'
+                echo ''
+                n=${#all_tags[@]}
+                start=$(( n > 20 ? n - 20 : 0 ))
+                for (( i = n - 1; i >= start; i-- )); do
+                  printf -- '- `%s`\n' "${all_tags[$i]}"
+                done
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            version="$requested"
+          fi
+
+          echo "target_version=$version" >> "$GITHUB_OUTPUT"
+          echo "latest_version=$latest"  >> "$GITHUB_OUTPUT"
+          echo "上游最新版本: $latest"
+          echo "本次同步版本: $version"
+
+      - name: 拉取该 tag 并建同名分支
+        env:
+          VERSION: ${{ steps.resolve.outputs.target_version }}
+          LATEST: ${{ steps.resolve.outputs.latest_version }}
+        run: |
+          set -euo pipefail
+
+          git remote add upstream "$UPSTREAM_REPO" 2>/dev/null \
+            || git remote set-url upstream "$UPSTREAM_REPO"
+
+          # 只取这一个 tag 及其历史
+          git fetch --no-tags upstream "refs/tags/$VERSION"
+          # 注解 tag 指向 tag 对象，必须解引用到 commit
+          commit="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          branch="refs/heads/$VERSION"
+
+          remote_commit="$(git ls-remote --heads origin "$branch" | awk '{print $1}')"
+
+          if [ -z "$remote_commit" ]; then
+            git push origin "$commit:$branch"
+            result="新建分支"
+            echo "create  $VERSION -> ${commit:0:8}"
+          elif [ "$remote_commit" = "$commit" ]; then
+            result="已存在且一致"
+            echo "skip    $VERSION 已存在且一致"
+          elif [ "$FORCE" != "true" ]; then
+            result="已存在，未更新（如需覆盖请勾选强制拉取）"
+            echo "skip    $VERSION 已存在但指向不同 commit (${remote_commit:0:8} -> ${commit:0:8})"
+          else
+            git push --force-with-lease="$branch:$remote_commit" origin "$commit:$branch"
+            result="已强制更新"
+            echo "update  $VERSION: ${remote_commit:0:8} -> ${commit:0:8}"
+          fi
+
+          {
+            echo '## 同步结果'
+            echo ''
+            echo '| 项 | 值 |'
+            echo '| --- | --- |'
+            echo "| 目标版本 | \`$VERSION\` |"
+            echo "| 上游最新版本 | \`$LATEST\` |"
+            echo "| 上游 commit | \`${commit:0:8}\` |"
+            echo "| 分支 | \`$VERSION\` |"
+            echo "| 强制拉取 | $([ "$FORCE" = "true" ] && echo '是' || echo '否') |"
+            echo "| 结果 | $result |"
+          } >> "$GITHUB_STEP_SUMMARY"
