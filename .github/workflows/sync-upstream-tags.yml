@@ -13,6 +13,13 @@
 #   - 仅手动触发，没有定时任务。
 #   - 只识别 x.y.z 或 x.y.z-N 形式的版本 tag，nightly / fdroid-version 会被忽略。
 #   - 本仓库即使还没有任何 commit 也能运行；首次运行后本仓库会多出对应版本分支。
+#   - **必须配置 PAT**：上游 rustdesk 的 tag 树里含 .github/workflows/*，而 github.token
+#     是 GitHub App token，永远不能推送新增/修改 workflow 文件的提交（YAML 的 permissions
+#     里也没有可用的 workflows scope）。请在仓库 Secrets 里建 SYNC_TOKEN，值为带 workflow
+#     权限的 PAT；存在时会自动优先使用，不存在才退回 github.token。
+#   - 仓库级 Settings → Actions → General → Workflow permissions 必须允许写；
+#     只读时「预检 token 权限」这一步会直接报出原因，不会拖到 push 才失败。
+#   - 任何一步失败都会把原因写进该次运行的 Summary，不依赖下载日志。
 
 name: Sync upstream tag to branch
 
@@ -50,11 +57,20 @@ jobs:
       # 本项目可能是空仓库（尚无 commit），因此不用 actions/checkout，
       # 直接初始化一个只用于推送的本地仓库。
       - name: 初始化仓库并配置凭据
+        id: init
         env:
-          TOKEN: ${{ github.token }}
+          # 优先用带 workflow 权限的 PAT（secret SYNC_TOKEN）；没有则退回 github.token
+          TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          TOKEN_KIND: ${{ secrets.SYNC_TOKEN && 'pat' || 'github_token' }}
         run: |
           set -euo pipefail
           echo "::add-mask::$TOKEN"
+          echo "token_kind=$TOKEN_KIND" >> "$GITHUB_OUTPUT"
+          if [ "$TOKEN_KIND" = "pat" ]; then
+            echo "凭据来源: 仓库 secret SYNC_TOKEN（PAT）"
+          else
+            echo "凭据来源: github.token（无权推送 .github/workflows 下的文件）"
+          fi
           git init -q -b main
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -64,13 +80,91 @@ jobs:
           git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic ${auth}"
           echo "origin: https://github.com/${GITHUB_REPOSITORY}.git"
 
+      # 先确认当前 token 真的有写权限。仓库级 Workflow permissions 为只读时，
+      # 这里会立刻失败并说明改哪里，而不是等 fetch 完 20 秒才在 push 处报 403。
+      - name: 预检 token 权限
+        id: preflight
+        env:
+          TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          TOKEN_KIND: ${{ steps.init.outputs.token_kind }}
+        run: |
+          set -euo pipefail
+
+          if [ "$TOKEN_KIND" != "pat" ]; then
+            echo "::warning::未配置 secret SYNC_TOKEN，正在使用 github.token。github.token 无法推送含 .github/workflows/* 的提交，本次 push 很可能被拒绝。"
+          fi
+
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          http_code="$(curl -sS -o /tmp/repo.json -w '%{http_code}' \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H 'Accept: application/vnd.github+json' "$api" || echo 000)"
+          echo "GET $api -> HTTP $http_code"
+
+          if [ "$http_code" != "200" ]; then
+            echo "::error::无法读取仓库信息（HTTP $http_code），token 可能无效"
+            {
+              echo '## 同步失败：预检'
+              echo ''
+              echo "- 调用 \`GET /repos/${GITHUB_REPOSITORY}\` 返回 HTTP \`$http_code\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          can_push="$(python3 - <<'PY'
+          import json
+          d = json.load(open('/tmp/repo.json'))
+          p = d.get('permissions')
+          if p is None:
+              print('unknown')
+          else:
+              print('true' if p.get('push') else 'false')
+          PY
+          )"
+          echo "token 推送权限: $can_push"
+
+          if [ "$can_push" = "false" ]; then
+            echo "::error::当前 token 没有推送权限：请到 Settings → Actions → General → Workflow permissions 选择 Read and write permissions"
+            {
+              echo '## 同步失败：token 无写权限'
+              echo ''
+              echo '当前 token 对 `contents` 只有读权限，无法创建分支。'
+              echo ''
+              if [ "$TOKEN_KIND" = "pat" ]; then
+                echo '处理方式：检查 secret `SYNC_TOKEN` 这个 PAT 是否仍有本仓库的 **Contents: Read and write** 权限。'
+              else
+                echo '处理方式：打开本仓库 **Settings → Actions → General → Workflow permissions**，'
+                echo '选择 **Read and write permissions**，保存后重新运行本工作流。'
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if [ "$can_push" = "unknown" ]; then
+            echo "::warning::API 未返回 permissions 字段，跳过推送权限预检，继续执行"
+          fi
+
       - name: 解析目标版本
         id: resolve
         run: |
           set -euo pipefail
 
+          # 先取原始 tag 列表；网络/权限失败要和「没有匹配的 tag」区分开，
+          # 否则会把自己的网络问题误报成上游没有版本 tag。
+          if ! tags_raw="$(git ls-remote --tags --refs "$UPSTREAM_REPO" 'refs/tags/*' 2>&1)"; then
+            msg="查询上游 tag 失败：$(printf '%s' "$tags_raw" | tail -n 3 | tr '\n' ' ')"
+            echo "::error::$msg"
+            {
+              echo '## 同步失败：解析版本'
+              echo ''
+              echo '| 项 | 值 |'
+              echo '| --- | --- |'
+              echo '| 上游仓库 | `'"$UPSTREAM_REPO"'` |'
+              echo "| 原因 | $msg |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
           mapfile -t all_tags < <(
-            git ls-remote --tags --refs "$UPSTREAM_REPO" 'refs/tags/*' \
+            printf '%s\n' "$tags_raw" \
               | awk -F'refs/tags/' '{print $2}' \
               | grep -E "$TAG_PATTERN" \
               | sort -V
@@ -78,6 +172,11 @@ jobs:
 
           if [ "${#all_tags[@]}" -eq 0 ]; then
             echo "::error::上游没有匹配 $TAG_PATTERN 的版本 tag"
+            {
+              echo '## 同步失败：解析版本'
+              echo ''
+              echo "上游 \`$UPSTREAM_REPO\` 的 tag 里没有匹配 \`$TAG_PATTERN\` 的版本号。"
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
@@ -119,19 +218,73 @@ jobs:
         run: |
           set -euo pipefail
 
+          # 失败时把原因同时写进 Summary，这样不用登录下载日志也能看到
+          fail() {
+            local msg="$1"
+            echo "::error::$msg"
+            {
+              echo '## 同步失败'
+              echo ''
+              echo '| 项 | 值 |'
+              echo '| --- | --- |'
+              echo "| 目标版本 | \`$VERSION\` |"
+              echo "| 失败阶段 | $2 |"
+              echo "| 原因 | $msg |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+
+          # push 失败时先看是不是被 GitHub 的 workflow 文件限制拒绝的。
+          # github.token 属于 GitHub App，永远不能推送新增/修改 .github/workflows/* 的提交，
+          # 而上游 rustdesk 的 tag 树里就带着 .github/workflows/ —— 必须换成带 workflow 权限的 PAT。
+          push_fail() {
+            local stage="$1" detail hint=''
+            detail="$(tail -n 3 "$push_log" | tr '\n' ' ')"
+            if grep -qiE 'workflows? permission|refusing to allow a GitHub App' "$push_log"; then
+              hint="被 GitHub 拒绝：当前 token 无权推送 .github/workflows 下的文件。上游 tag \`$VERSION\` 的树包含 .github/workflows/*，而 github.token 是 GitHub App token，永远无法推送这类提交，YAML 里的 permissions 也没有可用的 workflows scope。请创建带 workflow 权限的 PAT（classic 勾 repo+workflow，或 fine-grained 给 Contents 和 Workflows 读写），存为仓库 secret SYNC_TOKEN 后重跑。"
+            fi
+            if [ -n "$hint" ]; then
+              fail "$hint 原始错误：$detail" "$stage"
+            fi
+            fail "推送分支 \`$VERSION\` 失败：$detail" "$stage"
+          }
+
           git remote add upstream "$UPSTREAM_REPO" 2>/dev/null \
             || git remote set-url upstream "$UPSTREAM_REPO"
 
-          # 只取这一个 tag 及其历史
-          git fetch --no-tags upstream "refs/tags/$VERSION"
+          # 只取这一个 tag 及其历史；网络抖动时重试，避免一次 EOF 就整轮失败
+          fetch_log="$(mktemp)"
+          fetched=0
+          for attempt in 1 2 3; do
+            echo "fetch 第 $attempt 次: refs/tags/$VERSION"
+            if git fetch --no-tags upstream "refs/tags/$VERSION" 2>&1 | tee "$fetch_log"; then
+              fetched=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$fetched" -ne 1 ]; then
+            fail "拉取上游 tag 失败（已重试 3 次）：$(tail -n 3 "$fetch_log" | tr '\n' ' ')" "git fetch"
+          fi
+
           # 注解 tag 指向 tag 对象，必须解引用到 commit
-          commit="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          if ! commit="$(git rev-parse 'FETCH_HEAD^{commit}' 2>&1)"; then
+            fail "无法解析 tag 指向的 commit：$commit" "git rev-parse"
+          fi
           branch="refs/heads/$VERSION"
 
-          remote_commit="$(git ls-remote --heads origin "$branch" | awk '{print $1}')"
+          # 查远端同名分支；origin 不可达或凭据被拒时也要走 fail() 写 Summary，
+          # 否则 set -e 会直接退出、Summary 留空。
+          if ! lsremote_out="$(git ls-remote --heads origin "$branch" 2>&1)"; then
+            fail "查询远端分支失败：$(printf '%s' "$lsremote_out" | tail -n 3 | tr '\n' ' ')" "git ls-remote"
+          fi
+          remote_commit="$(printf '%s\n' "$lsremote_out" | awk '{print $1}' | head -n 1)"
+          push_log="$(mktemp)"
 
           if [ -z "$remote_commit" ]; then
-            git push origin "$commit:$branch"
+            if ! git push origin "$commit:$branch" 2>&1 | tee "$push_log"; then
+              push_fail "git push（新建）"
+            fi
             result="新建分支"
             echo "create  $VERSION -> ${commit:0:8}"
           elif [ "$remote_commit" = "$commit" ]; then
@@ -141,7 +294,9 @@ jobs:
             result="已存在，未更新（如需覆盖请勾选强制拉取）"
             echo "skip    $VERSION 已存在但指向不同 commit (${remote_commit:0:8} -> ${commit:0:8})"
           else
-            git push --force-with-lease="$branch:$remote_commit" origin "$commit:$branch"
+            if ! git push --force-with-lease="$branch:$remote_commit" origin "$commit:$branch" 2>&1 | tee "$push_log"; then
+              push_fail "git push（强制）"
+            fi
             result="已强制更新"
             echo "update  $VERSION: ${remote_commit:0:8} -> ${commit:0:8}"
           fi
