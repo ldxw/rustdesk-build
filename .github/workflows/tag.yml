@@ -1,0 +1,765 @@
+# 给上游 tag 对应的 commit 打同名 tag，从而触发上游自带的 Flutter 构建。
+#
+# 背景：上游 rustdesk 的构建入口是 .github/workflows/flutter-tag.yml
+#   on: workflow_dispatch + push: tags（匹配 v?X.Y.Z[-N] 四种写法）
+# 它调用同 commit 内的 flutter-build.yml（18 个平台 job），并传
+#   upload-tag: ${{ github.ref_name }}
+# 作为发布用的 tag 名。
+#
+# GitHub 在 push tag 事件里读取的是「tag 指向的 commit」中的工作流文件，而不是默认分支上的。
+# 因此把 tag 打在同步过来的上游 commit 上，上游自带的 flutter-tag.yml / flutter-build.yml
+# 就会在本仓库里直接运行，不需要把这些文件复制到 main，也不必维护一份 3000 行的构建定义。
+#
+# 文件：.github/workflows/tag.yml（独立的一整套打标签流程，与同步工作流互不依赖）
+#
+# 用法：Actions → Tag build (trigger upstream Flutter build) → Run workflow
+#   version          要构建的版本 tag（如 1.5.3，也接受 v1.5.3）；留空或 latest 取上游最新版本 tag
+#   force            tag 已存在但指向不同 commit 时是否覆盖（默认关闭）
+#   hbb_common_ref   libs/hbb_common 使用的 ref（分支 / tag / commit）；
+#                    留空或 latest 表示取 fork 上最新的版本 tag（x.y.z / x.y.z-N），
+#                    fork 没有版本 tag 时退回 fork 的默认分支（当前是 main）
+#   admin_url        客户端内置 web 面板（API server）地址；留空取 secret ADMIN_URL，
+#                    再为空则用内置默认。填 none 表示不改，保留上游的 admin.rustdesk.com
+#
+# web 面板地址：
+#   客户端「地址簿 → Web 控制台」调 bind.mainGetApiServer()，最终落到 src/common.rs 的
+#   get_api_server_()：api-server 选项 > 编译期 API_SERVER > 自定义中继推导 > 硬编码兜底
+#   "https://admin.rustdesk.com"。派生 commit 里把这条兜底改成 admin_url，产物就会打开自建面板。
+#
+# hbb_common 子模块：
+#   上游 .gitmodules 把 libs/hbb_common 指向 https://github.com/rustdesk/hbb_common。
+#   本工作流不直接给上游 commit 打 tag，而是先派生一个新 commit：父为上游 commit，
+#   只改写 .gitmodules 里 libs/hbb_common 的 url 和该子模块的 gitlink，再把 tag 打在
+#   派生 commit 上。这样上游 flutter-build.yml 里 actions/checkout 的
+#   submodules: recursive 会从 fork 拉 hbb_common。
+#
+# 软件更新链：
+#   客户端「检查更新」默认 POST https://api.rustdesk.com/version/latest，并且只认
+#   github.com/rustdesk/rustdesk 的 release 地址和上游内嵌公钥。本工作流在派生 commit 里
+#   把发现改成 GET 本仓库滚动 release（tag update-latest）里的 version.json，并把 release
+#   前缀、下载白名单、内嵌公钥换成 UPDATE_REPO 与本仓库密钥；随后由「Publish update
+#   metadata」工作流发布 rustdesk-update.json（+ .sig）。
+#   相关配置：vars RUSTDESK_UPDATE_ED25519_PUBLIC_KEY（公钥）、
+#             secret RUSTDESK_UPDATE_ED25519_SEED（私钥种子），两者必须成对。
+#
+# 注意：
+#   - 必须配置 PAT（secret SYNC_TOKEN）。GITHUB_TOKEN 推送的 tag 不会触发其它工作流。
+#   - 目标 commit 最好先用「Sync upstream tag to branch」同步一次；否则本次 push 会连同
+#     .github/workflows/* 一起上传，需要 PAT 具备 workflow 权限。
+#   - 上游 flutter-build.yml 的 VERSION 目前硬编码为 1.5.3，且 Windows/macOS 构建后会校验
+#     版本号；因此当前只有 1.5.3 能完整通过，详见 README。
+
+name: Tag build (trigger upstream Flutter build)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '要构建的版本 tag（如 1.5.3）；留空或填 latest 表示上游最新版本'
+        required: false
+        default: 'latest'
+      force:
+        description: 'tag 已存在但指向不同 commit 时强制覆盖（默认关闭）'
+        type: boolean
+        default: false
+      hbb_common_ref:
+        description: 'libs/hbb_common 使用的 ref（分支 / tag / commit）；latest 表示 fork 上最新的版本 tag，fork 没有版本 tag 时退回默认分支'
+        required: false
+        default: 'latest'
+      admin_url:
+        description: '客户端内置 web 面板地址（如 https://admin.example.com）；留空取 secret ADMIN_URL，再空用内置默认；填 none 不改'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tag-build
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: https://github.com/rustdesk/rustdesk.git
+      # 客户端更新链指向本仓库：发现入口是本仓库滚动 release update-latest 里的 version.json
+      UPDATE_REPO: ${{ github.repository }}
+      UPSTREAM_UPDATE_REPO: 'rustdesk/rustdesk'
+      UPDATE_DISCOVERY_TAG: 'update-latest'
+      # base64 编码的 32 字节 Ed25519 公钥，必须与 secret RUSTDESK_UPDATE_ED25519_SEED 成对
+      UPDATE_PUBLIC_KEY: ${{ vars.RUSTDESK_UPDATE_ED25519_PUBLIC_KEY }}
+      # libs/hbb_common 子模块替换为 fork；构建时 checkout 会按 .gitmodules 从这里克隆
+      HBB_COMMON_REPO: https://github.com/ldxw/rustdesk_hbb_common
+      HBB_COMMON_REF: ${{ inputs.hbb_common_ref || 'latest' }}
+      REQUESTED_VERSION: ${{ inputs.version || 'latest' }}
+      FORCE: ${{ inputs.force || 'false' }}
+      # 客户端内置 web 面板地址。优先级：输入 > secret ADMIN_URL > 内置默认。
+      # 填 none 表示不改，保留上游的 admin.rustdesk.com。
+      ADMIN_URL: ${{ inputs.admin_url != '' && inputs.admin_url || (secrets.ADMIN_URL != '' && secrets.ADMIN_URL || 'https://admin-hy.rs.ldxw.top') }}
+      # 上游 src/common.rs 里的兜底地址，替换时按这个字面量匹配
+      UPSTREAM_ADMIN_URL: 'https://admin.rustdesk.com'
+      # 只认版本号形式的 tag，排除 nightly / fdroid-version
+      TAG_PATTERN: '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$'
+
+    steps:
+      - name: 初始化仓库并配置凭据
+        id: init
+        env:
+          # 必须用 PAT：GITHUB_TOKEN 推送的 tag 不会触发其它工作流
+          TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          TOKEN_KIND: ${{ secrets.SYNC_TOKEN && 'pat' || 'github_token' }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$TOKEN"
+          echo "token_kind=$TOKEN_KIND" >> "$GITHUB_OUTPUT"
+          if [ "$TOKEN_KIND" = "pat" ]; then
+            echo "凭据来源: 仓库 secret SYNC_TOKEN（PAT）"
+          else
+            echo "凭据来源: github.token（推送的 tag 不会触发构建）"
+          fi
+          git init -q -b main
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          # token 只写入 local config，不出现在 URL、命令行参数和日志里
+          auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic ${auth}"
+          echo "origin: https://github.com/${GITHUB_REPOSITORY}.git"
+
+      # GITHUB_TOKEN 推送 tag 不会触发新的工作流运行，这里直接硬失败，
+      # 免得用户以为构建已经启动、实际什么都不会发生。
+      - name: 预检 token
+        id: preflight
+        env:
+          TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          TOKEN_KIND: ${{ steps.init.outputs.token_kind }}
+        run: |
+          set -euo pipefail
+
+          if [ "$TOKEN_KIND" != "pat" ]; then
+            msg='未配置 secret `SYNC_TOKEN`。`GITHUB_TOKEN` 推送的 tag 不会触发其它工作流，因此无法启动构建。请按 README「前置设置 1」配置 PAT。'
+            echo "::error::$msg"
+            {
+              echo '## 打 tag 失败：缺少 PAT'
+              echo ''
+              echo "$msg"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          http_code="$(curl -sS -o /tmp/repo.json -w '%{http_code}' \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H 'Accept: application/vnd.github+json' "$api" || echo 000)"
+          echo "GET $api -> HTTP $http_code"
+
+          if [ "$http_code" != "200" ]; then
+            echo "::error::无法读取仓库信息（HTTP $http_code），PAT 可能无效"
+            {
+              echo '## 打 tag 失败：预检'
+              echo ''
+              echo "- 调用 \`GET /repos/${GITHUB_REPOSITORY}\` 返回 HTTP \`$http_code\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          can_push="$(python3 - <<'PY'
+          import json
+          d = json.load(open('/tmp/repo.json'))
+          p = d.get('permissions') or {}
+          print('true' if p.get('push') else 'false')
+          PY
+          )"
+          echo "PAT 推送权限: $can_push"
+
+          if [ "$can_push" != "true" ]; then
+            msg='secret `SYNC_TOKEN` 这个 PAT 没有本仓库的写权限，无法创建 tag。请检查它的 Contents 权限（classic: 勾 repo；fine-grained: Contents: Read and write）。'
+            echo "::error::$msg"
+            {
+              echo '## 打 tag 失败：token 无写权限'
+              echo ''
+              echo "$msg"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: 解析目标版本
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          # 先取原始 tag 列表；网络/权限失败要和「没有匹配的 tag」区分开
+          if ! tags_raw="$(git ls-remote --tags --refs "$UPSTREAM_REPO" 'refs/tags/*' 2>&1)"; then
+            msg="查询上游 tag 失败：$(printf '%s' "$tags_raw" | tail -n 3 | tr '\n' ' ')"
+            echo "::error::$msg"
+            {
+              echo '## 打 tag 失败：解析版本'
+              echo ''
+              echo '| 项 | 值 |'
+              echo '| --- | --- |'
+              echo '| 上游仓库 | `'"$UPSTREAM_REPO"'` |'
+              echo "| 原因 | $msg |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          mapfile -t all_tags < <(
+            printf '%s\n' "$tags_raw" \
+              | awk -F'refs/tags/' '{print $2}' \
+              | grep -E "$TAG_PATTERN" \
+              | sort -V
+          )
+
+          if [ "${#all_tags[@]}" -eq 0 ]; then
+            echo "::error::上游没有匹配 $TAG_PATTERN 的版本 tag"
+            {
+              echo '## 打 tag 失败：解析版本'
+              echo ''
+              echo "上游 \`$UPSTREAM_REPO\` 的 tag 里没有匹配 \`$TAG_PATTERN\` 的版本号。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          latest="${all_tags[-1]}"
+          requested="$REQUESTED_VERSION"
+
+          if [ -z "$requested" ] || [ "$requested" = "latest" ]; then
+            version="$latest"
+          else
+            # 容忍手填的 v 前缀
+            requested="${requested#v}"
+            if ! printf '%s\n' "${all_tags[@]}" | grep -Fxq "$requested"; then
+              echo "::error::上游不存在版本 tag: $requested"
+              {
+                echo "## 未找到版本 \`$requested\`"
+                echo ''
+                echo '可用版本（最近 20 个，新的在前）：'
+                echo ''
+                n=${#all_tags[@]}
+                start=$(( n > 20 ? n - 20 : 0 ))
+                for (( i = n - 1; i >= start; i-- )); do
+                  printf -- '- `%s`\n' "${all_tags[$i]}"
+                done
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            version="$requested"
+          fi
+
+          echo "target_version=$version" >> "$GITHUB_OUTPUT"
+          echo "latest_version=$latest"  >> "$GITHUB_OUTPUT"
+          echo "上游最新版本: $latest"
+          echo "本次构建版本: $version"
+
+      # hbb_common_ref 填 latest（默认）时取 fork 上最新的版本 tag；
+      # fork 没有版本 tag 时退回 fork 的默认分支，保证开箱可用。
+      - name: 解析 hbb_common ref
+        id: hbb
+        run: |
+          set -euo pipefail
+
+          requested="$HBB_COMMON_REF"
+          if [ -z "$requested" ] || [ "$requested" = "latest" ]; then
+            tags_raw="$(git ls-remote --tags --refs "$HBB_COMMON_REPO" 'refs/tags/*' 2>&1 || true)"
+            mapfile -t hbb_tags < <(
+              printf '%s\n' "$tags_raw" \
+                | awk -F'refs/tags/' 'NF>1{print $2}' \
+                | grep -E "$TAG_PATTERN" \
+                | sort -V
+            )
+            if [ "${#hbb_tags[@]}" -gt 0 ]; then
+              resolved="${hbb_tags[-1]}"
+              echo "hbb_common 最新版本 tag: $resolved"
+            else
+              default_branch="$(git ls-remote --symref "$HBB_COMMON_REPO" HEAD 2>/dev/null \
+                | awk '/^ref:/{sub("refs/heads/", "", $2); print $2; exit}')"
+              resolved="${default_branch:-main}"
+              echo "hbb_common 没有版本 tag，退回默认分支: $resolved"
+            fi
+          else
+            resolved="${requested#refs/tags/}"
+            resolved="${resolved#refs/heads/}"
+            echo "hbb_common 使用手动指定的 ref: $resolved"
+          fi
+
+          echo "resolved_ref=$resolved" >> "$GITHUB_OUTPUT"
+          echo "requested_ref=$requested" >> "$GITHUB_OUTPUT"
+
+      - name: 打 tag 触发构建
+        env:
+          VERSION: ${{ steps.resolve.outputs.target_version }}
+          LATEST: ${{ steps.resolve.outputs.latest_version }}
+          HBB_REF: ${{ steps.hbb.outputs.resolved_ref }}
+          HBB_REF_REQUESTED: ${{ steps.hbb.outputs.requested_ref }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            local msg="$1"
+            echo "::error::$msg"
+            {
+              echo '## 打 tag 失败'
+              echo ''
+              echo '| 项 | 值 |'
+              echo '| --- | --- |'
+              echo "| 目标版本 | \`$VERSION\` |"
+              echo "| 失败阶段 | $2 |"
+              echo "| 原因 | $msg |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+
+          # 推送内容若包含 .github/workflows/* 的改动，需要 PAT 的 workflow 权限
+          push_fail() {
+            local stage="$1" detail hint=''
+            detail="$(tail -n 3 "$push_log" | tr '\n' ' ')"
+            if grep -qiE 'workflows? permission|refusing to allow a GitHub App' "$push_log"; then
+              hint="被 GitHub 拒绝：本次推送包含 .github/workflows/* 的改动，而当前凭据没有 workflow 权限。请给 secret \`SYNC_TOKEN\` 这个 PAT 加上 workflow 权限（classic 勾 repo+workflow；fine-grained 给 Contents 与 Workflows 读写），或先运行一次同步工作流把源码推上去再重跑。"
+            fi
+            if [ -n "$hint" ]; then
+              fail "$hint 原始错误：$detail" "$stage"
+            fi
+            fail "推送 tag \`$VERSION\` 失败：$detail" "$stage"
+          }
+
+          git remote add upstream "$UPSTREAM_REPO" 2>/dev/null \
+            || git remote set-url upstream "$UPSTREAM_REPO"
+
+          # 只取这一个 tag 及其历史；网络抖动时重试
+          fetch_log="$(mktemp)"
+          fetched=0
+          for attempt in 1 2 3; do
+            echo "fetch 第 $attempt 次: refs/tags/$VERSION"
+            if git fetch --no-tags upstream "refs/tags/$VERSION" 2>&1 | tee "$fetch_log"; then
+              fetched=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$fetched" -ne 1 ]; then
+            fail "拉取上游 tag 失败（已重试 3 次）：$(tail -n 3 "$fetch_log" | tr '\n' ' ')" "git fetch"
+          fi
+
+          # 注解 tag 指向 tag 对象，必须解引用到 commit
+          if ! upstream_commit="$(git rev-parse 'FETCH_HEAD^{commit}' 2>&1)"; then
+            fail "无法解析 tag 指向的 commit：$upstream_commit" "git rev-parse"
+          fi
+
+          # ---- 派生 commit：改写 libs/hbb_common 的 .gitmodules url 与 gitlink ----
+          # 上游 flutter-build.yml 的 actions/checkout 带 submodules: recursive，
+          # 它按被 checkout 的 commit 里的 .gitmodules 克隆子模块。所以要让构建用上
+          # fork，tag 必须指向一个 .gitmodules 已改写的 commit，而不是上游 commit 本身。
+
+          hbb_log="$(mktemp)"
+          if ! git fetch --no-tags "$HBB_COMMON_REPO" "$HBB_REF" >"$hbb_log" 2>&1; then
+            fail "从 \`$HBB_COMMON_REPO\` 拉取 \`$HBB_REF\` 失败：$(tail -n 3 "$hbb_log" | tr '\n' ' ')" "git fetch hbb_common"
+          fi
+          if ! hbb_commit="$(git rev-parse 'FETCH_HEAD^{commit}' 2>&1)"; then
+            fail "无法解析 hbb_common 的 commit：$hbb_commit" "git rev-parse hbb_common"
+          fi
+          echo "hbb_common: $HBB_COMMON_REPO@$HBB_REF -> ${hbb_commit:0:8}"
+
+          gitlink="$(git ls-tree "$upstream_commit" libs/hbb_common)"
+          if [ -z "$gitlink" ]; then
+            fail "上游 commit 里没有 libs/hbb_common 子模块" "派生 commit"
+          fi
+          if [ "$(printf '%s' "$gitlink" | awk '{print $1}')" != "160000" ]; then
+            fail "libs/hbb_common 不是子模块：$gitlink" "派生 commit"
+          fi
+
+          gm_src="$(mktemp)"; gm_new="$(mktemp)"
+          if ! git cat-file blob "$upstream_commit:.gitmodules" > "$gm_src" 2>/dev/null; then
+            fail "上游 commit 里没有 .gitmodules" "派生 commit"
+          fi
+          if ! python3 - "$gm_src" "$gm_new" "$HBB_COMMON_REPO" <<'PY'
+          import re, sys
+          src, dst, repo = sys.argv[1], sys.argv[2], sys.argv[3]
+          text = open(src, encoding='utf-8').read()
+          out, section, hit = [], None, False
+          for ln in text.splitlines(keepends=True):
+              m = re.match(r'^\s*\[submodule\s+"([^"]+)"\]\s*$', ln)
+              if m:
+                  section = m.group(1)
+              elif section == 'libs/hbb_common' and re.match(r'^\s*url\s*=', ln):
+                  ln = '\turl = %s\n' % repo
+                  hit = True
+              out.append(ln)
+          if not hit:
+              sys.exit(3)
+          open(dst, 'w', encoding='utf-8').write(''.join(out))
+          PY
+          then
+            fail ".gitmodules 里找不到 libs/hbb_common 的 url 行（上游格式可能变了）" "派生 commit"
+          fi
+
+          # ---- 改写客户端内置 web 面板地址 ----
+          # get_api_server_() 的兜底就是 src/common.rs 里这一行字面量。换掉它，
+          # 「地址簿 → Web 控制台」以及账号/API 相关调用就会指向自建面板。
+          # 上游 flutter-build.yml 的 env 里没有 API_SERVER，编译期覆盖用不上，只能改源码。
+          admin_url="$ADMIN_URL"
+          admin_state='keep'
+          cm_new=''
+          if [ -z "$admin_url" ] || [ "$admin_url" = "none" ]; then
+            echo "web 面板地址: 保持上游默认（$UPSTREAM_ADMIN_URL）"
+          else
+            case "$admin_url" in
+              http://*|https://*) ;;
+              *) fail "admin_url 必须以 http:// 或 https:// 开头：\`$admin_url\`" "派生 commit" ;;
+            esac
+            # 与 get_api_server() 的后处理一致：末尾的 / 会被去掉，这里先归一化
+            admin_url="${admin_url%/}"
+            if [ "$admin_url" = "$UPSTREAM_ADMIN_URL" ]; then
+              admin_state='same'
+              echo "web 面板地址: $admin_url（与上游一致，不改写）"
+            else
+              cm_src="$(mktemp)"; cm_new="$(mktemp)"
+              if ! git cat-file blob "$upstream_commit:src/common.rs" > "$cm_src" 2>/dev/null; then
+                fail "上游 commit 里没有 src/common.rs（上游目录结构可能变了）" "派生 commit"
+              fi
+              # 只替换恰好带双引号的字面量（避免误伤注释或其它域名）
+              if ! python3 -c 'import sys; s, d, o, n = sys.argv[1:5]; t = open(s, encoding="utf-8", newline="").read(); k = chr(34) + o + chr(34); sys.exit(3) if k not in t else open(d, "w", encoding="utf-8", newline="").write(t.replace(k, chr(34) + n + chr(34)))' "$cm_src" "$cm_new" "$UPSTREAM_ADMIN_URL" "$admin_url"; then
+                fail "上游 \`src/common.rs\` 里找不到字面量 \`\"$UPSTREAM_ADMIN_URL\"\`（上游可能已改动这一行）" "派生 commit"
+              fi
+              admin_state='rewrite'
+              echo "web 面板地址: $UPSTREAM_ADMIN_URL -> $admin_url"
+            fi
+          fi
+
+          # ---- 改写客户端内置的更新地址 ----
+          # 上游的 do_check_software_update() 会 POST api.rustdesk.com/version/latest 拿 release 页 URL，
+          # 再去 github.com/rustdesk/rustdesk 下载 rustdesk-update.json 与安装包。这里全部换成本仓库：
+          #   发现入口   -> 本仓库滚动 release `update-latest` 里的 version.json（GET 静态文件）；
+          #   元数据/安装包 -> 本仓库同名 tag 的 release 资产，字节由源码内嵌公钥验签；
+          #   桌面端更新卡片 / 移动端更新提示 -> 本仓库 releases 页面。
+          # 公钥必须与 secret RUSTDESK_UPDATE_ED25519_SEED 成对，否则客户端会拒绝所有元数据。
+          update_state='keep'
+          if [ "$UPDATE_REPO" = "$UPSTREAM_UPDATE_REPO" ]; then
+            echo "更新链: 保持上游（$UPSTREAM_UPDATE_REPO）"
+          else
+            case "$UPDATE_REPO" in
+              */*/*) fail "UPDATE_REPO 必须是 owner/repo 形式：\`$UPDATE_REPO\`" "派生 commit" ;;
+              */*) ;;
+              *) fail "UPDATE_REPO 必须是 owner/repo 形式：\`$UPDATE_REPO\`" "派生 commit" ;;
+            esac
+            update_owner="${UPDATE_REPO%%/*}"
+            update_name="${UPDATE_REPO#*/}"
+            if [ -z "$update_owner" ] || [ -z "$update_name" ]; then
+              fail "UPDATE_REPO 必须是 owner/repo 形式：\`$UPDATE_REPO\`" "派生 commit"
+            fi
+            if [ -z "$UPDATE_PUBLIC_KEY" ]; then
+              fail "缺少 vars.RUSTDESK_UPDATE_ED25519_PUBLIC_KEY（base64 编码的 32 字节 Ed25519 公钥）" "派生 commit"
+            fi
+
+            # src/common.rs 可能已经被上面的 admin 改写动过，直接在上面接力，避免丢改动。
+            uc_src="$(mktemp)"; uc_dst="$(mktemp)"
+            if [ -n "$cm_new" ]; then
+              cp "$cm_new" "$uc_src"
+            else
+              if ! git cat-file blob "$upstream_commit:src/common.rs" > "$uc_src" 2>/dev/null; then
+                fail "上游 commit 里没有 src/common.rs（上游目录结构可能变了）" "派生 commit"
+              fi
+            fi
+
+            # 1) release 页 URL 白名单加上本仓库 owner/repo
+            # 2) 发现请求从 POST + JSON 体改成 GET 静态 version.json
+            # 3) 两处 POST 调用点同步改成 GET
+            # 4) 段首注释说明新的 URL 语义
+            if ! python3 - "$uc_src" "$uc_dst" "$update_owner" "$update_name" "$UPDATE_DISCOVERY_TAG" <<'PY'
+          import sys
+
+          src, dst, owner, name, disc = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+          text = open(src, encoding='utf-8', newline='').read()
+
+          # 保留上游两条 arm，追加本仓库两条，避免 unreachable pattern 与单测回归。
+          arm = '        ["rustdesk", "rustdesk", "releases", "tag", release_id, ""] => *release_id,\n'
+          added = ('        ["%s", "%s", "releases", "tag", release_id] => *release_id,\n'
+                   '        ["%s", "%s", "releases", "tag", release_id, ""] => *release_id,\n') % (
+                       owner, name, owner, name)
+          if arm not in text:
+              sys.exit(3)
+          if added not in text:
+              text = text.replace(arm, arm + added, 1)
+
+          old_head = ('    let (request, url) =\n'
+                      '        hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());\n')
+          new_head = '    let url = "https://github.com/%s/%s/releases/download/%s/version.json".to_string();\n' % (
+              owner, name, disc)
+          if text.count(old_head) != 1:
+              sys.exit(4)
+          text = text.replace(old_head, new_head)
+
+          old_post = 'client.post(&url).json(&request).send().await'
+          if text.count(old_post) != 2:
+              sys.exit(5)
+          text = text.replace(old_post, 'client.get(&url).send().await')
+
+          old_c1 = '// No need to check `danger_accept_invalid_cert` for now.\n'
+          old_c2 = '// Because the url is always `https://api.rustdesk.com/version/latest`.\n'
+          new_c1 = '// The discovery url is a static file in this repository release channel.\n'
+          new_c2 = '// A plain GET keeps it compatible with GitHub release asset downloads.\n'
+          if text.count(old_c1) != 1 or text.count(old_c2) != 1:
+              sys.exit(6)
+          text = text.replace(old_c1, new_c1).replace(old_c2, new_c2)
+
+          open(dst, 'w', encoding='utf-8', newline='').write(text)
+          PY
+            then
+              fail "改写 \`src/common.rs\` 的更新发现逻辑失败（上游可能已改动这一段）" "派生 commit"
+            fi
+            cm_new="$uc_dst"
+
+            # 元数据/签名/安装包的前缀与下载白名单：上游 owner/repo 之外再放行本仓库。
+            ua_src="$(mktemp)"; ua_dst="$(mktemp)"
+            if ! git cat-file blob "$upstream_commit:src/updater/artifact.rs" > "$ua_src" 2>/dev/null; then
+              fail "上游 commit 里没有 src/updater/artifact.rs（上游目录结构可能变了）" "派生 commit"
+            fi
+            if ! python3 - "$ua_src" "$ua_dst" "$update_owner" "$update_name" <<'PY'
+          import sys
+
+          src, dst, owner, name = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+          text = open(src, encoding='utf-8', newline='').read()
+
+          old_p = 'format!("https://github.com/rustdesk/rustdesk/releases/download/{release_id}/")'
+          new_p = 'format!("https://github.com/%s/%s/releases/download/{release_id}/")' % (owner, name)
+          if text.count(old_p) != 1:
+              sys.exit(3)
+          text = text.replace(old_p, new_p)
+
+          old_w = '    if owner != "rustdesk"\n        || repo != "rustdesk"\n'
+          new_w = ('    let repo_allowed = (owner == "rustdesk" && repo == "rustdesk")\n'
+                   '        || (owner == "%s" && repo == "%s");\n'
+                   '    if !repo_allowed\n') % (owner, name)
+          if text.count(old_w) != 1:
+              sys.exit(4)
+          text = text.replace(old_w, new_w)
+
+          open(dst, 'w', encoding='utf-8', newline='').write(text)
+          PY
+            then
+              fail "改写 \`src/updater/artifact.rs\` 的下载前缀失败（上游可能已改动这一段）" "派生 commit"
+            fi
+
+            # 内嵌可信公钥：vars 里是 base64，源码里是 32 个十进制字面量。
+            um_src="$(mktemp)"; um_dst="$(mktemp)"
+            if ! git cat-file blob "$upstream_commit:src/update_metadata.rs" > "$um_src" 2>/dev/null; then
+              fail "上游 commit 里没有 src/update_metadata.rs（上游目录结构可能变了）" "派生 commit"
+            fi
+            if ! python3 - "$um_src" "$um_dst" "$UPDATE_PUBLIC_KEY" <<'PY'
+          import base64
+          import re
+          import sys
+
+          src, dst, encoded = sys.argv[1], sys.argv[2], sys.argv[3]
+          try:
+              raw = base64.b64decode(encoded, validate=True)
+          except Exception:
+              sys.exit(3)
+          if len(raw) != 32 or base64.b64encode(raw).decode() != encoded:
+              sys.exit(3)
+          lines = []
+          for i in range(0, 32, 16):
+              lines.append('        ' + ', '.join(str(b) for b in raw[i:i + 16]) + ',')
+          block = '    public_key: [\n' + '\n'.join(lines) + '\n    ]'
+          text = open(src, encoding='utf-8', newline='').read()
+          pat = re.compile(r'public_key:\s*\[\s*\d+(?:\s*,\s*\d+)*\s*\]', re.S)
+          if len(pat.findall(text)) != 1:
+              sys.exit(4)
+          text = pat.sub(lambda m: block, text, count=1)
+          open(dst, 'w', encoding='utf-8', newline='').write(text)
+          PY
+            then
+              fail "注入 \`src/update_metadata.rs\` 可信公钥失败（检查 vars.RUSTDESK_UPDATE_ED25519_PUBLIC_KEY 是否为 canonical base64 的 32 字节公钥）" "派生 commit"
+            fi
+
+            # 桌面端更新卡片的两处入口 + 移动端更新提示
+            dh_src="$(mktemp)"; dh_dst="$(mktemp)"
+            if ! git cat-file blob "$upstream_commit:flutter/lib/desktop/pages/desktop_home_page.dart" > "$dh_src" 2>/dev/null; then
+              fail "上游 commit 里没有 flutter/lib/desktop/pages/desktop_home_page.dart" "派生 commit"
+            fi
+            if ! python3 - "$dh_src" "$dh_dst" "$update_owner" "$update_name" <<'PY'
+          import sys
+
+          src, dst, owner, name = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+          text = open(src, encoding='utf-8', newline='').read()
+
+          old_dl = "final Uri url = Uri.parse('https://rustdesk.com/download');"
+          new_dl = "final Uri url = Uri.parse('https://github.com/%s/%s/releases');" % (owner, name)
+          old_tag = "https://github.com/rustdesk/rustdesk/releases/tag/"
+          new_tag = "https://github.com/%s/%s/releases/tag/" % (owner, name)
+          if text.count(old_dl) != 1 or text.count(old_tag) != 1:
+              sys.exit(3)
+          text = text.replace(old_dl, new_dl).replace(old_tag, new_tag)
+
+          open(dst, 'w', encoding='utf-8', newline='').write(text)
+          PY
+            then
+              fail "改写 \`desktop_home_page.dart\` 的更新链接失败（上游可能已改动这一段）" "派生 commit"
+            fi
+
+            cn_src="$(mktemp)"; cn_dst="$(mktemp)"
+            if ! git cat-file blob "$upstream_commit:flutter/lib/mobile/pages/connection_page.dart" > "$cn_src" 2>/dev/null; then
+              fail "上游 commit 里没有 flutter/lib/mobile/pages/connection_page.dart" "派生 commit"
+            fi
+            if ! python3 - "$cn_src" "$cn_dst" "$update_owner" "$update_name" <<'PY'
+          import sys
+
+          src, dst, owner, name = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+          text = open(src, encoding='utf-8', newline='').read()
+
+          old_dl = "final url = 'https://rustdesk.com/download';"
+          new_dl = "final url = 'https://github.com/%s/%s/releases';" % (owner, name)
+          if text.count(old_dl) != 1:
+              sys.exit(3)
+          text = text.replace(old_dl, new_dl)
+
+          open(dst, 'w', encoding='utf-8', newline='').write(text)
+          PY
+            then
+              fail "改写 \`connection_page.dart\` 的更新链接失败（上游可能已改动这一段）" "派生 commit"
+            fi
+
+            ua_new="$ua_dst"
+            um_new="$um_dst"
+            dh_new="$dh_dst"
+            cn_new="$cn_dst"
+            update_state='rewrite'
+            echo "更新链: 改写为 $UPDATE_REPO（发现入口 $UPDATE_DISCOVERY_TAG/version.json）"
+          fi
+
+          # 用临时 index 造树：整棵上游树 + 新的 .gitmodules blob + 新的 gitlink
+          # （admin_url / 更新链生效时再加新的 src/common.rs、src/updater/artifact.rs、
+          #   src/update_metadata.rs 与两个 Flutter 文件的 blob）
+          idx_dir="$(mktemp -d)"
+          export GIT_INDEX_FILE="$idx_dir/index"
+          git read-tree "$upstream_commit"
+          git update-index --cacheinfo 100644,"$(git hash-object -w "$gm_new")",.gitmodules
+          git update-index --cacheinfo 160000,"$hbb_commit",libs/hbb_common
+          if [ -n "$cm_new" ]; then
+            git update-index --cacheinfo 100644,"$(git hash-object -w "$cm_new")",src/common.rs
+          fi
+          if [ "$update_state" = "rewrite" ]; then
+            git update-index --cacheinfo 100644,"$(git hash-object -w "$ua_new")",src/updater/artifact.rs
+            git update-index --cacheinfo 100644,"$(git hash-object -w "$um_new")",src/update_metadata.rs
+            git update-index --cacheinfo 100644,"$(git hash-object -w "$dh_new")",flutter/lib/desktop/pages/desktop_home_page.dart
+            git update-index --cacheinfo 100644,"$(git hash-object -w "$cn_new")",flutter/lib/mobile/pages/connection_page.dart
+          fi
+          tree="$(git write-tree)"
+          unset GIT_INDEX_FILE
+
+          if [ "$admin_state" = "rewrite" ]; then
+            if ! git grep -qF "\"$admin_url\"" "$tree" -- src/common.rs; then
+              fail "派生 commit 的 src/common.rs 校验失败：没有 \`$admin_url\`" "派生 commit"
+            fi
+            if git grep -qF "\"$UPSTREAM_ADMIN_URL\"" "$tree" -- src/common.rs; then
+              fail "派生 commit 的 src/common.rs 仍含上游地址 \`$UPSTREAM_ADMIN_URL\`" "派生 commit"
+            fi
+          fi
+
+          if [ "$update_state" = "rewrite" ]; then
+            if git grep -qF 'client.post(&url).json(&request)' "$tree" -- src/common.rs; then
+              fail "派生 commit 的 src/common.rs 仍用 POST 请求检查更新" "派生 commit"
+            fi
+            if ! git grep -qF "releases/download/${UPDATE_DISCOVERY_TAG}/version.json" "$tree" -- src/common.rs; then
+              fail "派生 commit 的 src/common.rs 没有指向 ${UPDATE_DISCOVERY_TAG}/version.json" "派生 commit"
+            fi
+            if ! git grep -qF "\"${update_owner}\", \"${update_name}\", \"releases\", \"tag\"" "$tree" -- src/common.rs; then
+              fail "派生 commit 的 src/common.rs 没有放行 ${UPDATE_REPO} 的 release URL" "派生 commit"
+            fi
+            if git grep -qF 'format!("https://github.com/rustdesk/rustdesk/releases/download/' "$tree" -- src/updater/artifact.rs; then
+              fail "派生 commit 的 src/updater/artifact.rs 仍以硬编码上游前缀拼接元数据地址" "派生 commit"
+            fi
+            if ! git grep -qF "https://github.com/${UPDATE_REPO}/releases" "$tree" -- flutter/lib/desktop/pages/desktop_home_page.dart flutter/lib/mobile/pages/connection_page.dart; then
+              fail "派生 commit 的 Flutter 更新链接没有指向 ${UPDATE_REPO}" "派生 commit"
+            fi
+          fi
+
+          # author/committer date 取上游 commit 的时间，保证同样输入得到同样的 SHA，
+          # 这样重跑时「tag 已存在且一致」能正确命中，而不是每次都变成冲突。
+          up_date="$(git show -s --format=%cI "$upstream_commit")"
+          msg="build: point libs/hbb_common at ${HBB_COMMON_REPO}@${HBB_REF} (${hbb_commit})"
+          if [ "$admin_state" = "rewrite" ]; then
+            msg="$msg"$'\n\n'"build: set client api server to ${admin_url}"
+          fi
+          if [ "$update_state" = "rewrite" ]; then
+            msg="$msg"$'\n\n'"build: use ${UPDATE_REPO} for client updates"
+          fi
+          commit="$(
+            GIT_AUTHOR_NAME='github-actions[bot]' \
+            GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' \
+            GIT_AUTHOR_DATE="$up_date" \
+            GIT_COMMITTER_NAME='github-actions[bot]' \
+            GIT_COMMITTER_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' \
+            GIT_COMMITTER_DATE="$up_date" \
+            git commit-tree "$tree" -p "$upstream_commit" -m "$msg"
+          )"
+          if [ "$(git ls-tree "$commit" libs/hbb_common | awk '{print $3}')" != "$hbb_commit" ]; then
+            fail "派生 commit 的 hbb_common gitlink 校验失败" "派生 commit"
+          fi
+          echo "派生 commit: ${commit:0:8}（父 ${upstream_commit:0:8}）"
+
+          tag_ref="refs/tags/$VERSION"
+
+          if ! lsremote_out="$(git ls-remote --tags --refs origin "$tag_ref" 2>&1)"; then
+            fail "查询远端 tag 失败：$(printf '%s' "$lsremote_out" | tail -n 3 | tr '\n' ' ')" "git ls-remote"
+          fi
+          remote_sha="$(printf '%s\n' "$lsremote_out" | awk '{print $1}' | head -n 1)"
+          push_log="$(mktemp)"
+
+          if [ -z "$remote_sha" ]; then
+            if ! git push origin "$commit:$tag_ref" 2>&1 | tee "$push_log"; then
+              push_fail "git push（新建 tag）"
+            fi
+            result="新建 tag，已触发构建"
+            echo "create  $VERSION -> ${commit:0:8}"
+          elif [ "$remote_sha" = "$commit" ]; then
+            result="tag 已存在且一致，未触发新的构建"
+            echo "skip    $VERSION tag 已存在且一致"
+          elif [ "$FORCE" != "true" ]; then
+            result="tag 已存在，未更新（如需覆盖请勾选强制覆盖）"
+            echo "skip    $VERSION tag 已存在但指向不同 commit (${remote_sha:0:8} -> ${commit:0:8})"
+          else
+            if ! git push --force-with-lease="$tag_ref:$remote_sha" origin "$commit:$tag_ref" 2>&1 | tee "$push_log"; then
+              push_fail "git push（强制 tag）"
+            fi
+            result="已强制更新 tag，已触发构建"
+            echo "update  $VERSION: ${remote_sha:0:8} -> ${commit:0:8}"
+          fi
+
+          {
+            echo '## 打 tag 结果'
+            echo ''
+            echo '| 项 | 值 |'
+            echo '| --- | --- |'
+            echo "| 目标版本 | \`$VERSION\` |"
+            echo "| 上游最新版本 | \`$LATEST\` |"
+            echo "| 上游 commit | \`${upstream_commit:0:8}\` |"
+            if [ "$HBB_REF_REQUESTED" = "$HBB_REF" ]; then
+              echo "| hbb_common | \`$HBB_COMMON_REPO\`@\`$HBB_REF\` → \`${hbb_commit:0:8}\` |"
+            else
+              echo "| hbb_common | \`$HBB_COMMON_REPO\`@\`$HBB_REF\`（输入 \`$HBB_REF_REQUESTED\` 解析得到）→ \`${hbb_commit:0:8}\` |"
+            fi
+            if [ "$admin_state" = "rewrite" ]; then
+              echo "| web 面板地址 | \`$admin_url\`（已改写 \`src/common.rs\`，上游默认 \`$UPSTREAM_ADMIN_URL\`） |"
+            elif [ "$admin_state" = "same" ]; then
+              echo "| web 面板地址 | \`$admin_url\`（与上游一致，未改写） |"
+            else
+              echo "| web 面板地址 | 保持上游默认 \`$UPSTREAM_ADMIN_URL\`（\`admin_url=none\` 或留空） |"
+            fi
+            if [ "$update_state" = "rewrite" ]; then
+              echo "| 更新链 | 已指向本仓库 \`$UPDATE_REPO\`（发现入口 \`$UPDATE_DISCOVERY_TAG/version.json\`，安装包取自本仓库 release） |"
+            else
+              echo "| 更新链 | 保持上游 \`$UPSTREAM_UPDATE_REPO\`（未改写） |"
+            fi
+            echo "| tag 指向 commit | \`${commit:0:8}\`（派生 commit，只改写 .gitmodules / gitlink$([ "$admin_state" = "rewrite" ] && echo ' / src/common.rs')$([ "$update_state" = "rewrite" ] && echo ' / 更新链')） |"
+            echo "| tag | \`$VERSION\` |"
+            echo "| 强制覆盖 | $([ "$FORCE" = "true" ] && echo '是' || echo '否') |"
+            echo "| 结果 | $result |"
+            echo ''
+            echo '构建由 tag commit 内的上游工作流 `.github/workflows/flutter-tag.yml`（运行名 **Flutter Tag Build**）执行，'
+            echo '请到 **Actions** 列表查看同名运行。tag 已存在且一致时 GitHub 不会产生新事件；'
+            echo '需要重新构建同一个版本时，请对该次运行使用 **Re-run all jobs**，或先删除该 tag 再重跑本工作流。'
+            echo ''
+            echo '注意：上游 `flutter-build.yml` 的 `VERSION` 目前硬编码为 `1.5.3`，Windows/macOS 构建后还会校验版本号，'
+            echo '因此当前只有 `1.5.3` 能完整通过；其它版本会在校验处失败（详见 README）。'
+          } >> "$GITHUB_STEP_SUMMARY"

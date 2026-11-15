@@ -1,0 +1,275 @@
+# 在「Flutter Tag Build」成功后，为本次构建的 tag 补齐软件更新链所需的东西：
+#   1. 下载该 tag release 里已上传的 7 个安装包；
+#   2. 用 res/update/generate_update_metadata.py 生成并签名 rustdesk-update.json；
+#   3. 校验 metadata 与本地资产、公钥完全一致；
+#   4. 上传 rustdesk-update.json.sig，再上传 rustdesk-update.json（先签名后正文）；
+#   5. 刷新滚动 release `update-latest` 里的 version.json，指向刚发布的 tag。
+#
+# 客户端发现流程（本仓库构建的定制部分）：
+#   GET https://github.com/<本仓库>/releases/download/update-latest/version.json
+#   -> {"url":"https://github.com/<本仓库>/releases/tag/<tag>"}
+#   -> 解析 release id / 版本号 -> 该 tag 的 rustdesk-update.json (+ .sig)
+#   -> 下载对应平台的安装包并用 sha256 校验。
+#
+# 前置条件：
+#   - 本工作流必须位于默认分支，workflow_run 才会触发；
+#   - secrets.RUSTDESK_UPDATE_ED25519_SEED（base64 32 字节私钥种子）；
+#   - vars.RUSTDESK_UPDATE_ED25519_PUBLIC_KEY（base64 32 字节公钥，与 seed 成对）。
+#
+# 注意：tag 必须能被 display_version_from_release_id 接受（三段纯数字，可带 v 前缀）。
+# 形如 1.5.3-1 的 tag 仍会发布资产，但客户端发现不了，只给 warning。
+
+name: Publish update metadata
+
+on:
+  workflow_run:
+    workflows: ["Flutter Tag Build"]
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-release-assets-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: 解析构建 tag
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          tag=""
+          if [ -n "$HEAD_BRANCH" ] && gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${HEAD_BRANCH}" >/dev/null 2>&1; then
+            tag="$HEAD_BRANCH"
+          fi
+
+          if [ -z "$tag" ]; then
+            refs="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/")"
+            matches="$(jq -r --arg sha "$HEAD_SHA" \
+              '[.[][] | select((.object.sha // "") == $sha or (.object.object.sha? // "") == $sha) | .ref | sub("^refs/tags/"; "")] | .[]' \
+              <<<"$refs")"
+            count="$(printf '%s\n' "$matches" | grep -c . || true)"
+            if [ "$count" -gt 1 ]; then
+              echo "::error::多个 tag 指向同一个提交 ${HEAD_SHA}，无法确定要发布哪一个："
+              printf '%s\n' "$matches"
+              exit 1
+            fi
+            if [ "$count" -eq 1 ]; then
+              tag="$(printf '%s\n' "$matches" | head -n 1)"
+            fi
+          fi
+
+          if [ -z "$tag" ]; then
+            echo "::notice::无法从 workflow_run 解析出版本 tag（可能是 workflow_dispatch 手动触发），跳过发布。"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "构建 tag：\`$tag\`，派生版本号：\`$version\`"
+
+          if ! printf '%s' "$version" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::warning::tag \`$tag\` 不是三段纯数字版本，客户端无法通过该 release 发现更新。"
+          fi
+
+      - name: 拒绝覆盖已发布的更新元数据
+        if: steps.resolve.outputs.tag != ''
+        env:
+          TAG_NAME: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          releases="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
+          release_id="$(jq -r --arg tag "$TAG_NAME" \
+            '[.[][] | select(.tag_name == $tag)] | if length == 0 then "" elif length == 1 then (.[0].id | tostring) else error("multiple releases found for tag") end' \
+            <<<"$releases")"
+
+          if [ -z "$release_id" ]; then
+            echo "tag \`$TAG_NAME\` 还没有 release，构建应当已由平台 job 创建；继续。"
+            exit 0
+          fi
+
+          assets="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100")"
+          if jq -e 'any(.[][]; .name == "rustdesk-update.json")' <<<"$assets" >/dev/null; then
+            echo "::error::Signed update metadata is already published for ${TAG_NAME}; use a new release tag for corrected artifacts."
+            exit 1
+          fi
+          echo "tag \`$TAG_NAME\` 尚未发布更新元数据，继续。"
+
+      - name: Checkout 构建 tag
+        if: steps.resolve.outputs.tag != ''
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ steps.resolve.outputs.tag }}
+          persist-credentials: false
+
+      - name: Install Python
+        if: steps.resolve.outputs.tag != ''
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        if: steps.resolve.outputs.tag != ''
+        run: 'python -m pip install --only-binary=:all: --require-hashes -r res/update/update_metadata_requirements.txt'
+
+      - name: 下载该 tag 的 7 个安装包
+        if: steps.resolve.outputs.tag != ''
+        env:
+          TAG_NAME: ${{ steps.resolve.outputs.tag }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p ./artifacts
+          files=(
+            "rustdesk-${VERSION}-x86_64.exe"
+            "rustdesk-${VERSION}-x86_64.msi"
+            "rustdesk-${VERSION}-aarch64.exe"
+            "rustdesk-${VERSION}-aarch64.msi"
+            "rustdesk-${VERSION}-x86-sciter.exe"
+            "rustdesk-${VERSION}-aarch64.dmg"
+            "rustdesk-${VERSION}-x86_64.dmg"
+          )
+          for name in "${files[@]}"; do
+            gh release download "$TAG_NAME" --dir ./artifacts --pattern "$name" --clobber
+            if [ ! -f "./artifacts/${name}" ]; then
+              echo "::error::release \`$TAG_NAME\` 缺少资产 \`$name\`"
+              exit 1
+            fi
+            echo "已下载 ${name}"
+          done
+
+          count="$(find ./artifacts -maxdepth 1 -type f -name 'rustdesk-*' | wc -l)"
+          if [ "$count" -ne 7 ]; then
+            echo "::error::./artifacts 下应恰好有 7 个安装包，实际 ${count} 个"
+            ls -la ./artifacts
+            exit 1
+          fi
+
+      - name: 校验密钥与源码内嵌公钥一致
+        if: steps.resolve.outputs.tag != ''
+        env:
+          RUSTDESK_UPDATE_ED25519_SEED: ${{ secrets.RUSTDESK_UPDATE_ED25519_SEED }}
+          RUSTDESK_UPDATE_ED25519_PUBLIC_KEY: ${{ vars.RUSTDESK_UPDATE_ED25519_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          python res/update/generate_update_metadata.py check-key --rust-source src/update_metadata.rs
+
+      - name: 生成并签名更新元数据
+        if: steps.resolve.outputs.tag != ''
+        env:
+          RUSTDESK_UPDATE_ED25519_SEED: ${{ secrets.RUSTDESK_UPDATE_ED25519_SEED }}
+          TAG_NAME: ${{ steps.resolve.outputs.tag }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          python res/update/generate_update_metadata.py sign \
+            --artifact windows x86_64 exe "./artifacts/rustdesk-${VERSION}-x86_64.exe" \
+            --artifact windows x86_64 msi "./artifacts/rustdesk-${VERSION}-x86_64.msi" \
+            --artifact windows aarch64 exe "./artifacts/rustdesk-${VERSION}-aarch64.exe" \
+            --artifact windows aarch64 msi "./artifacts/rustdesk-${VERSION}-aarch64.msi" \
+            --artifact windows x86 exe "./artifacts/rustdesk-${VERSION}-x86-sciter.exe" \
+            --artifact macos aarch64 dmg "./artifacts/rustdesk-${VERSION}-aarch64.dmg" \
+            --artifact macos x86_64 dmg "./artifacts/rustdesk-${VERSION}-x86_64.dmg" \
+            --version "$VERSION" --release-id "$TAG_NAME" \
+            --package-id rustdesk \
+            --release-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download" \
+            --published-at "$(git log -1 --format=%cI)" \
+            --metadata-out ./rustdesk-update.json \
+            --signature-out ./rustdesk-update.json.sig
+
+      - name: 校验更新元数据
+        if: steps.resolve.outputs.tag != ''
+        env:
+          RUSTDESK_UPDATE_ED25519_PUBLIC_KEY: ${{ vars.RUSTDESK_UPDATE_ED25519_PUBLIC_KEY }}
+          TAG_NAME: ${{ steps.resolve.outputs.tag }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          python res/update/generate_update_metadata.py verify \
+            --metadata ./rustdesk-update.json \
+            --signature ./rustdesk-update.json.sig \
+            --artifact "./artifacts/rustdesk-${VERSION}-x86_64.exe" \
+            --artifact "./artifacts/rustdesk-${VERSION}-x86_64.msi" \
+            --artifact "./artifacts/rustdesk-${VERSION}-aarch64.exe" \
+            --artifact "./artifacts/rustdesk-${VERSION}-aarch64.msi" \
+            --artifact "./artifacts/rustdesk-${VERSION}-x86-sciter.exe" \
+            --artifact "./artifacts/rustdesk-${VERSION}-aarch64.dmg" \
+            --artifact "./artifacts/rustdesk-${VERSION}-x86_64.dmg" \
+            --version "$VERSION" --release-id "$TAG_NAME" \
+            --package-id rustdesk \
+            --release-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download"
+
+      - name: 先上传签名，再上传元数据正文
+        if: steps.resolve.outputs.tag != ''
+        env:
+          TAG_NAME: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # 客户端先取 rustdesk-update.json 再取 .sig；不存在时只当作检查失败，
+          # 但先传正文后传签名会留下一个短暂的不可用窗口，所以顺序固定为先签名后正文。
+          gh release upload "$TAG_NAME" ./rustdesk-update.json.sig --clobber
+          gh release upload "$TAG_NAME" ./rustdesk-update.json --clobber
+
+      - name: 刷新滚动发现入口 update-latest
+        if: steps.resolve.outputs.tag != ''
+        env:
+          TAG_NAME: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          payload="$(mktemp)"
+          printf '{"url":"https://github.com/%s/releases/tag/%s"}\n' "$GITHUB_REPOSITORY" "$TAG_NAME" > "$payload"
+
+          if ! gh release view update-latest >/dev/null 2>&1; then
+            gh release create update-latest \
+              --prerelease \
+              --target "$GITHUB_SHA" \
+              --title "Update metadata (rolling)" \
+              --notes "客户端更新发现入口，由 Publish update metadata 工作流自动刷新，请勿手动修改。"
+          fi
+
+          gh release upload update-latest "$payload" --name version.json --clobber
+
+      - name: Summary
+        if: always()
+        env:
+          TAG_NAME: ${{ steps.resolve.outputs.tag }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## 更新元数据发布结果"
+            echo ""
+            if [ -z "${TAG_NAME}" ]; then
+              echo "未解析到版本 tag，本次跳过（workflow_run 未带来 tag 信息）。"
+            else
+              echo "| 项 | 值 |"
+              echo "| --- | --- |"
+              echo "| tag | \`${TAG_NAME}\` |"
+              echo "| 版本号 | \`${VERSION}\` |"
+              echo "| 更新元数据 | \`rustdesk-update.json\` + \`.sig\`（已签名） |"
+              echo "| 发现入口 | \`update-latest/version.json\` → \`releases/tag/${TAG_NAME}\` |"
+              echo ""
+              echo "客户端 GET \`https://github.com/${GITHUB_REPOSITORY}/releases/download/update-latest/version.json\` 即可发现该版本；"
+              echo "版本号必须严格大于客户端当前版本才会提示更新。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
